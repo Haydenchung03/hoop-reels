@@ -5,12 +5,13 @@ Seasons and game logs come from stats.nba.com through nba_api and are cached in 
 """
 from __future__ import annotations
 
+import re
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import lru_cache
 
-from nba_api.stats.endpoints import playercareerstats, playergamelog
+from nba_api.stats.endpoints import playbyplayv3, playercareerstats, playergamelog
 from nba_api.stats.static import players as static_players
 from nba_api.stats.static import teams as static_teams
 
@@ -185,3 +186,72 @@ def _games_cached(player_id: int, season: str) -> tuple:
 
 def get_games(player_id: int, season: str) -> list[dict]:
     return list(_games_cached(player_id, season))
+
+
+# --------------------------------------------------------------------------- play-by-play
+
+def _clock_secs(iso: str) -> float:
+    """'PT08M53.00S' -> 533.0"""
+    m = re.match(r"PT(\d+)M([\d.]+)S", iso or "")
+    return int(m.group(1)) * 60 + float(m.group(2)) if m else 0.0
+
+
+def _clock_label(secs: float) -> str:
+    return f"{int(secs // 60)}:{int(secs % 60):02d}" if secs >= 60 else f"{secs:.1f}"
+
+
+@lru_cache(maxsize=128)
+def _pbp(game_id: str) -> tuple:
+    data = playbyplayv3.PlayByPlayV3(game_id=game_id, timeout=TIMEOUT).get_dict()
+    return tuple(data.get("game", {}).get("actions", []))
+
+
+def player_events(game_id: str, player_id: int) -> list[dict]:
+    """Every play a player made happen: made shots, assists, steals, blocks, rebounds.
+
+    Each event has a priority used to pick the best plays when there are too many
+    for the reel's length.
+    """
+    actions = _pbp(game_id)
+    name = next((a["playerName"] for a in actions if a.get("personId") == player_id and a.get("playerName")), None)
+    if not name:
+        return []  # did not play, or no play-by-play for this game
+    assist_tag = re.compile(rf"\({re.escape(name)} \d+ AST\)")
+
+    events, off_seen = [], 0
+    for a in actions:
+        desc = a.get("description") or ""
+        kind = None
+        shot_big = "3PT" in desc or "Dunk" in desc or a.get("shotValue") == 3
+
+        if a.get("personId") == player_id:
+            if a.get("actionType") == "Made Shot":
+                kind = "3PT" if ("3PT" in desc or a.get("shotValue") == 3) else ("DUNK" if "Dunk" in desc else "FG")
+                priority = 10 if kind in ("3PT", "DUNK") else 7
+            elif "STEAL" in desc:
+                kind, priority = "STL", 7
+            elif "BLOCK" in desc:
+                kind, priority = "BLK", 8
+            elif a.get("actionType") == "Rebound":
+                m = re.search(r"Off:(\d+)", desc)
+                off = int(m.group(1)) if m else 0
+                kind, priority = ("OREB", 3) if off > off_seen else ("REB", 1)
+                off_seen = max(off_seen, off)
+        elif a.get("actionType") == "Made Shot" and assist_tag.search(desc):
+            kind, priority = "AST", 8 if shot_big else 6
+
+        if not kind:
+            continue
+        period, clock = int(a.get("period") or 0), _clock_secs(a.get("clock"))
+        if period >= 4:
+            priority += 1.5 + (1.5 if clock <= 120 else 0)  # crunch time matters more
+        events.append({
+            "id": a.get("actionNumber"),
+            "period": period,
+            "clock": clock,
+            "label": f"{'Q' + str(period) if period <= 4 else ('OT' if period == 5 else f'{period - 4}OT')} {_clock_label(clock)}",
+            "kind": kind,
+            "desc": desc,
+            "priority": priority,
+        })
+    return events

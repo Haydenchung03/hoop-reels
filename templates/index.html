@@ -71,8 +71,8 @@
       <div class="row">
         <fieldset class="pills">
           <legend>Focus</legend>
-          <label><input type="radio" name="focus" value="game" checked><span>Whole game</span></label>
-          <label><input type="radio" name="focus" value="player"><span>Just my player</span></label>
+          <label><input type="radio" name="focus" value="player" checked><span>Player highlights</span></label>
+          <label><input type="radio" name="focus" value="game"><span>Full game</span></label>
         </fieldset>
         <fieldset class="pills">
           <legend>Length</legend>
@@ -107,7 +107,9 @@
         <p class="actions">
           <a id="download-link" class="cta small" href="#">Download MP4</a>
         </p>
-        <p class="source">Footage: <a id="source-link" target="_blank" rel="noopener"></a></p>
+        <p id="reel-note" class="reel-note"></p>
+        <ol id="play-list" class="play-list"></ol>
+        <p class="source">Footage: <span id="source-links"></span></p>
       </div>
 
       <p id="error" class="error" role="alert" hidden></p>

@@ -3,3 +3,6 @@ nba_api>=1.10
 yt-dlp>=2025.10.22
 imageio-ffmpeg>=0.5
 numpy>=1.26
+# macOS text recognition, used to read the scoreboard for player reels
+pyobjc-framework-Vision>=10; sys_platform == "darwin"
+pyobjc-framework-Quartz>=10; sys_platform == "darwin"

@@ -100,9 +100,9 @@ def api_highlight():
         home=bool(game.get("home")),
         pts=game.get("pts") if isinstance(game.get("pts"), int) else None,
         series_game=game.get("series_game") if game.get("series_game") in range(1, 8) else None,
-        focus=body.get("focus") if body.get("focus") in ("game", "player") else "game",
+        focus=body.get("focus") if body.get("focus") in ("game", "player") else "player",
         length=body.get("length") if body.get("length") in (30, 60, 90, 120) else 60,
-        fmt=body.get("fmt") if body.get("fmt") in ("landscape", "vertical") else "landscape",
+        fmt=body.get("fmt") if body.get("fmt") in ("landscape", "vertical") else "vertical",
         video_id=video_id,
     )
 

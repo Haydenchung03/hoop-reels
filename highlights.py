@@ -1,13 +1,19 @@
-"""Find a highlight video for a game on YouTube, download it, and cut a short reel.
+"""Find highlight footage for a game on YouTube and cut a short reel.
 
-Pipeline:
-  1. search   - yt-dlp searches YouTube; titles are scored on team names, date, player name.
-  2. download - best stream at up to 720p, merged to mp4.
-  3. analyze  - audio loudness over time; crowd roars mark the big plays.
-  4. render   - the loudest moments are cut and joined with short fades (16:9 or 9:16).
+Two kinds of reel:
+
+* Player reel (focus="player"): the NBA play-by-play lists every play the player made
+  happen (shots, assists, steals, blocks, rebounds) with its quarter and game clock.
+  We download highlight videos (player-specific ones first, then full-game packages),
+  read the on-screen scoreboard frame by frame (scoreboard.py), find the moments whose
+  clock matches the player's plays, and cut only those. Every clip is one of their plays.
+
+* Game reel (focus="game"): one full-game highlight package; the loudest crowd moments
+  are cut together.
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from dataclasses import dataclass, field, replace
@@ -19,7 +25,8 @@ import imageio_ffmpeg
 import numpy as np
 from yt_dlp import YoutubeDL
 
-from nba_data import team_info
+import scoreboard
+from nba_data import player_events, team_info
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -30,11 +37,22 @@ for d in (SOURCE_DIR, OUTPUT_DIR):
 
 FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
 
-SEGMENT_SECONDS = 7.5   # length of each clip in the reel
-LEAD_IN = 5.0           # seconds kept before a loudness peak (the play builds up before the roar)
+SEGMENT_SECONDS = 7.5   # game reel: length of each clip
+LEAD_IN = 5.0           # game reel: seconds kept before a loudness peak
 MAX_SOURCE_SECONDS = 30 * 60  # skip full-game replays
+MAX_PLAYER_SOURCES = 3  # player reel: videos to scan at most
 BAD_WORDS = ("reaction", "2k", "simulation", "prediction", "preview", "live stream", "livestream",
              "full game replay", "podcast", "breakdown", "fantasy", "betting", "picks")
+
+# Seconds kept before / after the moment of each kind of play.
+PLAY_WINDOWS = {
+    "3PT": (5.0, 2.5), "DUNK": (5.0, 2.5), "FG": (5.0, 2.5),
+    "AST": (5.5, 2.5),                      # the pass comes before the basket
+    "BLK": (3.5, 3.0), "STL": (3.0, 4.0),   # a steal often turns into a fast break
+    "OREB": (3.5, 3.0), "REB": (3.0, 2.5),
+}
+KIND_NAMES = {"3PT": "3-pointer", "DUNK": "Dunk", "FG": "Bucket", "AST": "Assist",
+              "BLK": "Block", "STL": "Steal", "OREB": "Offensive rebound", "REB": "Rebound"}
 
 Report = Callable[[str, float, str], None]  # (stage, percent, message)
 
@@ -56,9 +74,9 @@ class Request:
     home: bool
     pts: int | None
     series_game: int | None = None  # playoff game number in the series (1-7)
-    focus: str = "game"        # "game" or "player"
+    focus: str = "player"      # "player" or "game"
     length: int = 60           # seconds
-    fmt: str = "landscape"     # "landscape" or "vertical"
+    fmt: str = "vertical"      # "vertical" or "landscape"
     video_id: str | None = None  # force a specific YouTube video
 
     teams: dict = field(init=False)
@@ -74,8 +92,12 @@ class Request:
         return datetime.strptime(self.date, "%Y-%m-%d")
 
     @property
+    def last_name(self) -> str:
+        return self.player_name.split()[-1]
+
+    @property
     def cache_key(self) -> str:
-        who = self.player_id if self.focus == "player" else "game"
+        who = f"p{self.player_id}v2" if self.focus == "player" else "game"
         src = self.video_id or "auto"
         return f"{self.game_id}_{who}_{self.length}s_{self.fmt}_{src}"
 
@@ -120,8 +142,7 @@ def _score(entry: dict, req: Request) -> float | None:
     score = 0.0
 
     if req.focus == "player":
-        last = req.player_name.split()[-1].lower()
-        name_hit = last in title or req.player_name.lower() in title
+        name_hit = req.last_name.lower() in title
         pts_hit = req.pts is not None and re.search(rf"\b{req.pts}\s*(?:pts|points)\b", title)
         if not name_hit or not (date_hit or (opp_hit and pts_hit)):
             return None
@@ -156,67 +177,59 @@ def _summary(e: dict) -> dict:
     }
 
 
-def find_candidates(req: Request) -> list[dict]:
+def _search_scored(req: Request, focus: str) -> tuple[list[dict], list[dict]]:
+    """(matching videos best-first, every search result) for focus 'player' or 'game'."""
     dt = req.dt
     day = f"{dt.strftime('%B')} {dt.day}, {dt.year}"
-    home, away = req.teams["home"], req.teams["away"]
-    game_queries = [
-        f"{away['nickname']} at {home['nickname']} full game highlights {day}",
-        f"{away['full_name']} vs {home['full_name']} highlights {day}",
-    ]
-    player_queries = [
-        f"{req.player_name} highlights vs {req.teams['opp']['nickname']} {day}",
-        f"{req.player_name} {req.pts} pts {req.teams['opp']['nickname']} {day}",
-    ]
-    if req.series_game:
-        n, y = req.series_game, dt.year
-        game_queries.append(f"{away['nickname']} vs {home['nickname']} {y} playoffs game {n} highlights")
-        player_queries.append(f"{req.player_name} {y} playoffs game {n} vs {req.teams['opp']['nickname']} highlights")
+    home, away, opp = req.teams["home"], req.teams["away"], req.teams["opp"]
+    if focus == "player":
+        queries = [
+            f"{req.player_name} highlights vs {opp['nickname']} {day}",
+            f"{req.player_name} {req.pts} pts {opp['nickname']} {day}",
+        ]
+        if req.series_game:
+            queries.append(f"{req.player_name} {dt.year} playoffs game {req.series_game} vs {opp['nickname']} highlights")
+    else:
+        queries = [
+            f"{away['nickname']} at {home['nickname']} full game highlights {day}",
+            f"{away['full_name']} vs {home['full_name']} highlights {day}",
+        ]
+        if req.series_game:
+            queries.append(f"{away['nickname']} vs {home['nickname']} {dt.year} playoffs game {req.series_game} highlights")
 
-    def run(queries: list[str], focus: str) -> tuple[list[dict], list[dict]]:
-        seen, scored, raw = set(), [], []
-        probe = replace(req, focus=focus) if focus != req.focus else req
-        for q in queries:
-            for e in _search(q):
-                if e["id"] in seen:
-                    continue
-                seen.add(e["id"])
-                raw.append(e)
-                s = _score(e, probe)
-                if s is not None:
-                    scored.append((s, e))
-        scored.sort(key=lambda x: -x[0])
-        return [_summary(e) for _, e in scored], [_summary(e) for e in raw]
+    probe = replace(req, focus=focus) if focus != req.focus else req
+    seen, scored, raw = set(), [], []
+    for q in queries:
+        for e in _search(q):
+            if e["id"] in seen:
+                continue
+            seen.add(e["id"])
+            raw.append(e)
+            s = _score(e, probe)
+            if s is not None:
+                scored.append((s, e))
+    scored.sort(key=lambda x: -x[0])
+    return [_summary(e) for _, e in scored], [_summary(e) for e in raw]
 
-    if req.focus == "player":
-        matches, raw = run(player_queries, "player")
-        if matches:
-            return matches
-        # No player package for that night - fall back to the full game highlights.
-        matches, raw2 = run(game_queries, "game")
-        if matches:
-            return matches
-        raise HighlightError("Couldn't find highlights for this game on YouTube.", (raw + raw2)[:8])
 
-    matches, raw = run(game_queries, "game")
-    if matches:
-        return matches
-    raise HighlightError("Couldn't find highlights for this game on YouTube.", raw[:8])
+def _forced_source(req: Request) -> dict:
+    return {"id": req.video_id, "title": "Selected video", "channel": "", "duration": None,
+            "url": f"https://www.youtube.com/watch?v={req.video_id}"}
 
 
 # --------------------------------------------------------------------------- download
 
-def download(video_id: str, report: Report) -> Path:
+def download(video_id: str, report: Report, lo: float = 10, hi: float = 55, label: str = "") -> Path:
     existing = [p for p in SOURCE_DIR.glob(f"{video_id}.*") if p.suffix in (".mp4", ".mkv", ".webm")]
     if existing:
-        report("download", 55, "Using cached source video")
+        report("download", hi, f"Using cached video{label}")
         return existing[0]
 
     def hook(d):
         if d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             frac = (d.get("downloaded_bytes") or 0) / total if total else 0
-            report("download", 10 + 45 * frac, f"Downloading source video… {frac:.0%}")
+            report("download", lo + (hi - lo) * frac, f"Downloading footage{label}… {frac:.0%}")
 
     opts = {
         "format": "bv*+ba/b",
@@ -239,7 +252,7 @@ def download(video_id: str, report: Report) -> Path:
     return files[0]
 
 
-# --------------------------------------------------------------------------- analyze
+# --------------------------------------------------------------------------- audio analysis (game reels)
 
 def probe_duration(path: Path) -> float:
     out = subprocess.run([FFMPEG, "-hide_banner", "-i", str(path)], capture_output=True, text=True).stderr
@@ -304,15 +317,15 @@ def pick_segments(duration: float, target: float, curve: np.ndarray | None, hop:
 
 # --------------------------------------------------------------------------- render
 
-def render(src: Path, clips, fmt: str, out: Path, report: Report) -> None:
+def render(clips: list[tuple[Path, float, float]], fmt: str, out: Path, report: Report, lo: float = 80) -> None:
     W, H = (720, 1280) if fmt == "vertical" else (1280, 720)
-    fade = 0.25
+    fade = 0.2
     args = [FFMPEG, "-y", "-hide_banner", "-v", "error", "-nostats", "-progress", "pipe:1"]
-    for s, e in clips:
+    for src, s, e in clips:
         args += ["-ss", f"{s:.2f}", "-t", f"{e - s:.2f}", "-i", str(src)]
 
     parts = []
-    for i, (s, e) in enumerate(clips):
+    for i, (_, s, e) in enumerate(clips):
         d = e - s
         fades = f"fade=t=in:st=0:d={fade},fade=t=out:st={max(0, d - fade):.2f}:d={fade}"
         if fmt == "vertical":
@@ -340,12 +353,12 @@ def render(src: Path, clips, fmt: str, out: Path, report: Report) -> None:
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(tmp),
     ]
-    total = sum(e - s for s, e in clips)
+    total = sum(e - s for _, s, e in clips)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     for line in proc.stdout:
         if line.startswith("out_time_us=") and line.strip() != "out_time_us=N/A":
-            done = int(line.split("=")[1]) / 1e6
-            report("render", 65 + 34 * min(1.0, done / total), f"Editing your reel… {min(1, done / total):.0%}")
+            frac = min(1.0, int(line.split("=")[1]) / 1e6 / total)
+            report("render", lo + (99 - lo) * frac, f"Editing your reel… {frac:.0%}")
     err = proc.stderr.read()
     if proc.wait() != 0:
         tmp.unlink(missing_ok=True)
@@ -354,38 +367,169 @@ def render(src: Path, clips, fmt: str, out: Path, report: Report) -> None:
     tmp.replace(out)
 
 
+# --------------------------------------------------------------------------- player reel
+
+def _play_clip(ev: dict, t: float, seg_index: int, segs: list[dict]) -> tuple[float, float] | None:
+    """Cut window for a play at video time t, kept inside its highlight segment."""
+    pre, post = PLAY_WINDOWS[ev["kind"]]
+    seg = segs[seg_index]
+    next_start = segs[seg_index + 1]["start"] if seg_index + 1 < len(segs) else float("inf")
+    s = max(seg["start"] - 0.5, t - pre, 0.0)
+    e = min(t + post, seg["end"] + 1.5, next_start - 0.2)
+    return (s, e) if e - s >= 2.5 else None
+
+
+def _select_plays(found: dict, target: float) -> list[dict]:
+    """Best plays first until the reel is long enough, then back in game order."""
+    picked, total = [], 0.0
+    for play in sorted(found.values(), key=lambda p: -p["ev"]["priority"]):
+        if total >= target - 2:
+            break
+        picked.append(play)
+        total += play["end"] - play["start"]
+    return sorted(picked, key=lambda p: (p["ev"]["period"], -p["ev"]["clock"]))
+
+
+def _merge(plays: list[dict]) -> list[dict]:
+    """Join plays that overlap in the same video (e.g. a steal and the layup after it)."""
+    merged: list[dict] = []
+    for p in plays:
+        last = merged[-1] if merged else None
+        if last and last["path"] == p["path"] and p["start"] <= last["end"] + 0.6 and p["end"] >= last["start"]:
+            last["start"], last["end"] = min(last["start"], p["start"]), max(last["end"], p["end"])
+            last["events"].append(p["ev"])
+        else:
+            merged.append({"path": p["path"], "start": p["start"], "end": p["end"], "events": [p["ev"]]})
+    return merged
+
+
+def make_player_reel(req: Request, report: Report) -> dict:
+    name = req.player_name
+    report("search", 2, f"Pulling {name}'s plays from the NBA play-by-play…")
+    try:
+        events = player_events(req.game_id, req.player_id)
+    except Exception as exc:
+        raise HighlightError(f"Couldn't load the play-by-play for this game ({type(exc).__name__}). Try again.")
+    events = [e for e in events if e["kind"] in PLAY_WINDOWS]
+    if not events:
+        raise HighlightError(f"The NBA has no play-by-play of {name} for this game, so a player reel isn't possible. "
+                             "Try the Full game option.")
+    if not scoreboard.available():
+        raise HighlightError("Player reels need macOS text recognition (pip install pyobjc-framework-Vision "
+                             "pyobjc-framework-Quartz). Use the Full game option instead.")
+
+    report("search", 5, f"Found {len(events)} {name} plays. Searching for footage…")
+    if req.video_id:
+        sources, others = [_forced_source(req)], []
+    else:
+        player_vids, raw_p = _search_scored(req, "player")
+        game_vids, raw_g = _search_scored(req, "game")
+        sources, seen = [], set()
+        for v in player_vids[:2] + game_vids[:2] + player_vids[2:] + game_vids[2:]:
+            if v["id"] not in seen:
+                seen.add(v["id"])
+                sources.append(v)
+        others = sources[MAX_PLAYER_SOURCES:]
+        sources = sources[:MAX_PLAYER_SOURCES]
+        if not sources:
+            raise HighlightError("Couldn't find footage of this game on YouTube.", (raw_p + raw_g)[:8])
+
+    found: dict = {}
+    used: list[dict] = []
+    span = 72 / len(sources)
+    for i, src in enumerate(sources):
+        lo = 8 + span * i
+        label = f" ({i + 1}/{len(sources)})" if len(sources) > 1 else ""
+        try:
+            path = download(src["id"], report, lo, lo + span * 0.5, label)
+        except Exception as exc:
+            if len(sources) == 1:
+                raise
+            print(f"skipping {src['id']}: {exc}")
+            continue
+        duration = probe_duration(path)
+        report("scan", lo + span * 0.5, f"Reading the scoreboard to find {name}'s plays{label}…")
+        rows = scoreboard.read_timeline(
+            path, duration,
+            lambda f: report("scan", lo + span * (0.5 + 0.5 * f), f"Reading the scoreboard to find {name}'s plays{label}… {f:.0%}"),
+        )
+        segs = scoreboard.segments(rows)
+        new = 0
+        for ev in events:
+            if ev["id"] in found:
+                continue
+            loc = scoreboard.locate(segs, ev["period"], ev["clock"])
+            if not loc:
+                continue
+            t, seg = loc
+            window = _play_clip(ev, t, segs.index(seg), segs)
+            if window:
+                found[ev["id"]] = {"path": path, "start": window[0], "end": window[1], "ev": ev}
+                new += 1
+        if new:
+            used.append({**src, "plays": new})
+        have = sum(p["end"] - p["start"] for p in found.values())
+        report("scan", lo + span, f"Spotted {len(found)} of {name}'s {len(events)} plays so far")
+        if have >= req.length - 2:
+            break
+
+    if not found:
+        raise HighlightError(
+            f"Found footage of the game, but couldn't spot any of {name}'s plays in it "
+            "(the scoreboard may be hidden or unreadable). Try another video below.",
+            sources + others,
+        )
+
+    clips = _merge(_select_plays(found, req.length))
+    render([(c["path"], c["start"], c["end"]) for c in clips], req.fmt, OUTPUT_DIR / f"{req.cache_key}.mp4", report)
+
+    plays = [{"label": ev["label"], "kind": KIND_NAMES[ev["kind"]], "desc": ev["desc"]}
+             for c in clips for ev in c["events"]]
+    seconds = sum(c["end"] - c["start"] for c in clips)
+    note = f"{len(plays)} of {name}'s plays · {seconds:.0f}s"
+    if seconds < req.length * 0.75:
+        note += f" (only {len(found)} of {len(events)} plays appear in the footage that's online)"
+    unused = [s for s in sources if s["id"] not in {u["id"] for u in used}]
+    return {"sources": used, "candidates": (unused + others)[:6], "plays": plays, "note": note,
+            "clips": [{"start": round(c["start"], 1), "end": round(c["end"], 1)} for c in clips]}
+
+
+# --------------------------------------------------------------------------- game reel
+
+def make_game_reel(req: Request, report: Report) -> dict:
+    report("search", 3, "Searching the web for game highlights…")
+    if req.video_id:
+        candidates = [_forced_source(req)]
+    else:
+        candidates, raw = _search_scored(req, "game")
+        if not candidates:
+            raise HighlightError("Couldn't find highlights for this game on YouTube.", raw[:8])
+    source = candidates[0]
+    report("search", 10, f"Found: {source['title']}")
+
+    path = download(source["id"], report, 10, 55)
+    report("analyze", 58, "Listening for the crowd to find the biggest plays…")
+    duration = probe_duration(path)
+    clips = pick_segments(duration, req.length, excitement_curve(path))
+
+    report("render", 65, f"Cutting {len(clips)} clips…")
+    render([(path, s, e) for s, e in clips], req.fmt, OUTPUT_DIR / f"{req.cache_key}.mp4", report, lo=65)
+    return {"sources": [source], "candidates": candidates[1:6], "plays": [],
+            "note": f"{len(clips)} biggest moments of the game",
+            "clips": [{"start": round(s, 1), "end": round(e, 1)} for s, e in clips]}
+
+
 # --------------------------------------------------------------------------- main entry
 
 def make_highlight(req: Request, report: Report) -> dict:
     out = OUTPUT_DIR / f"{req.cache_key}.mp4"
-
-    report("search", 3, "Searching the web for game highlights…")
-    if req.video_id:
-        candidates = [{"id": req.video_id, "title": "Selected video", "channel": "", "duration": None,
-                       "url": f"https://www.youtube.com/watch?v={req.video_id}"}]
-    else:
-        candidates = find_candidates(req)
-    source = candidates[0]
-    report("search", 10, f"Found: {source['title']}")
-
-    if out.exists():
+    meta = out.with_suffix(".json")
+    if out.exists() and meta.exists():
         report("render", 100, "Ready (cached)")
-        return {"file": out.name, "download_name": req.nice_name, "source": source,
-                "candidates": candidates[1:6], "clips": []}
+        return json.loads(meta.read_text())
 
-    src = download(source["id"], report)
-
-    report("analyze", 58, "Listening for the crowd to find the biggest plays…")
-    duration = probe_duration(src)
-    clips = pick_segments(duration, req.length, excitement_curve(src))
-
-    report("render", 65, f"Cutting {len(clips)} clips…")
-    render(src, clips, req.fmt, out, report)
+    result = make_player_reel(req, report) if req.focus == "player" else make_game_reel(req, report)
+    result.update({"file": out.name, "download_name": req.nice_name, "focus": req.focus})
+    meta.write_text(json.dumps(result))
     report("render", 100, "Done!")
-    return {
-        "file": out.name,
-        "download_name": req.nice_name,
-        "source": source,
-        "candidates": candidates[1:6],
-        "clips": [{"start": round(s, 1), "end": round(e, 1)} for s, e in clips],
-    }
+    return result

@@ -271,9 +271,17 @@
     $("result").classList.toggle("vertical", r.fmt === "vertical");
     $("download-link").href = r.download_url;
     $("download-link").setAttribute("download", r.download_name);
-    const src = $("source-link");
-    src.href = r.source.url;
-    src.textContent = r.source.channel ? `${r.source.title} (${r.source.channel})` : r.source.title;
+    $("reel-note").textContent = r.note || "";
+    $("play-list").replaceChildren(...(r.plays || []).map((p) =>
+      el("li", {},
+        el("span", { className: "play-when", textContent: p.label }),
+        el("span", { className: "play-kind", textContent: p.kind }),
+        el("span", { className: "play-desc", textContent: p.desc }))));
+    $("play-list").hidden = !(r.plays || []).length;
+    const links = (r.sources || []).map((s) =>
+      el("a", { href: s.url, target: "_blank", rel: "noopener",
+                textContent: s.channel ? `${s.title} (${s.channel})` : s.title }));
+    $("source-links").replaceChildren(...links.flatMap((a, i) => (i ? [" · ", a] : [a])));
     $("result").hidden = false;
     showAlternatives(r.candidates, "Wrong footage? Try another source:");
     video.play().catch(() => {});
