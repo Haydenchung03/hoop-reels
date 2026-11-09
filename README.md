@@ -4,9 +4,14 @@ Pick an NBA player, a season, and a game they played. The app cuts a 30s–2min 
 (their buckets, assists, steals, blocks and rebounds) from highlight footage on YouTube, ready for TikTok or Reels.
 Watch it in the page or download the MP4. A switch at the top flips between a bare-bones page and a styled one.
 
+> **Works best for modern games and players.** Recent seasons have the most highlight footage on YouTube,
+> consistently titled videos, and clear on-screen scoreboards, which player reels rely on. Historical games
+> are hit-or-miss: older games often have little or no footage online, the NBA play-by-play only goes back to
+> 1996-97, and older broadcasts' scoreboards are harder to read. Better support for historical games is planned.
+
 ## Run it
 
-Needs **Python 3.10+** (macOS's built-in `python3` is 3.9, so use `python3.12` or newer).
+Needs **Python 3.12+**. macOS's built-in `python3` is 3.9, which is too old. The latest yt-dlp needs 3.11+ and the latest numpy needs 3.12+.
 
 ```bash
 cd ~/Desktop/NBAGamesVideo
