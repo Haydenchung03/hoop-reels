@@ -1,0 +1,5 @@
+flask>=3.0
+nba_api>=1.10
+yt-dlp>=2025.10.22
+imageio-ffmpeg>=0.5
+numpy>=1.26

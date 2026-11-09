@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hoop Reels</title>
+  <!-- The whole "visually stunning" look lives in this one stylesheet.
+       Bare bones mode simply switches it off. -->
+  <link id="fancy-css" rel="stylesheet" href="{{ url_for('static', filename='stunning.css') }}">
+  <script>
+    try {
+      // ?theme=bare or ?theme=stunning overrides the remembered choice
+      var t = new URLSearchParams(location.search).get("theme") || localStorage.getItem("theme");
+      if (t === "bare") document.getElementById("fancy-css").disabled = true;
+    } catch (e) {}
+  </script>
+</head>
+<body>
+  <div class="court" aria-hidden="true"><span></span><span></span><span></span></div>
+
+  <header class="hero">
+    <div class="theme-switch">
+      <label>
+        <input type="checkbox" id="theme-toggle" checked>
+        <span class="switch-track"><span class="switch-thumb"></span></span>
+        <span class="switch-label">Visually stunning mode</span>
+      </label>
+    </div>
+    <p class="eyebrow">NBA highlight reels, made to order</p>
+    <h1>Hoop Reels</h1>
+    <p class="tagline">Pick a player and a night they played. We'll find the game footage and cut you a reel short enough for TikTok.</p>
+  </header>
+
+  <main>
+    <!-- Step 1 -->
+    <section class="card" id="step-player">
+      <h2><span class="step">1</span> Choose a player</h2>
+      <div class="search">
+        <label for="player-input">Player name</label>
+        <input id="player-input" type="search" autocomplete="off" spellcheck="false"
+               placeholder="e.g. Stephen Curry" aria-controls="player-suggestions">
+        <ul id="player-suggestions" role="listbox" hidden></ul>
+      </div>
+      <div id="player-card" class="player-card" hidden>
+        <img id="player-headshot" alt="" width="130" height="95" hidden>
+        <div>
+          <strong id="player-name"></strong>
+          <span id="player-meta"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Step 2 -->
+    <section class="card" id="step-game">
+      <h2><span class="step">2</span> Pick the night</h2>
+      <div class="row">
+        <label class="field">Season
+          <select id="season-select" disabled><option>—</option></select>
+        </label>
+        <label class="field grow">Game
+          <select id="game-select" disabled><option>Choose a season first</option></select>
+        </label>
+      </div>
+      <p id="game-status" class="status" role="status"></p>
+      <div id="game-preview" class="game-preview" hidden></div>
+    </section>
+
+    <!-- Step 3 -->
+    <section class="card" id="step-options">
+      <h2><span class="step">3</span> Shape your reel</h2>
+      <div class="row">
+        <fieldset class="pills">
+          <legend>Focus</legend>
+          <label><input type="radio" name="focus" value="game" checked><span>Whole game</span></label>
+          <label><input type="radio" name="focus" value="player"><span>Just my player</span></label>
+        </fieldset>
+        <fieldset class="pills">
+          <legend>Length</legend>
+          <label><input type="radio" name="length" value="30"><span>30s</span></label>
+          <label><input type="radio" name="length" value="60" checked><span>60s</span></label>
+          <label><input type="radio" name="length" value="90"><span>90s</span></label>
+          <label><input type="radio" name="length" value="120"><span>2 min</span></label>
+        </fieldset>
+        <fieldset class="pills">
+          <legend>Format</legend>
+          <label><input type="radio" name="fmt" value="vertical" checked><span>Vertical 9:16</span></label>
+          <label><input type="radio" name="fmt" value="landscape"><span>Landscape 16:9</span></label>
+        </fieldset>
+      </div>
+      <button id="make-btn" class="cta" disabled>Make my highlight reel</button>
+    </section>
+
+    <!-- Step 4 -->
+    <section class="card" id="step-result" hidden>
+      <h2><span class="step">4</span> Your reel</h2>
+
+      <div id="progress-wrap">
+        <div class="ball-loader" aria-hidden="true"><div class="ball"></div><div class="shadow"></div></div>
+        <progress id="progress" max="100" value="0"></progress>
+        <p id="progress-text" class="status" role="status"></p>
+      </div>
+
+      <div id="result" hidden>
+        <div class="video-frame">
+          <video id="video" controls playsinline preload="metadata"></video>
+        </div>
+        <p class="actions">
+          <a id="download-link" class="cta small" href="#">Download MP4</a>
+        </p>
+        <p class="source">Footage: <a id="source-link" target="_blank" rel="noopener"></a></p>
+      </div>
+
+      <p id="error" class="error" role="alert" hidden></p>
+
+      <div id="alternatives" hidden>
+        <p id="alt-title">Wrong footage? Try another source:</p>
+        <ul id="alt-list" class="alt-list"></ul>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    Stats from stats.nba.com via nba_api. Footage found on YouTube via yt-dlp. For personal use only.
+  </footer>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
